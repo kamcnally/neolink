@@ -130,7 +130,10 @@ impl NeoCamThread {
                         },
                         Err(_) => {
                             // Timeout
-                            if missed_pings < 5 {
+                            // Tolerate ~50s of missed pings (10 x 5s) before tearing
+                            // down an otherwise healthy connection, so a brief network
+                            // blip doesn't trigger an unnecessary reconnect.
+                            if missed_pings < 10 {
                                 missed_pings += 1;
                                 continue;
                             } else {
