@@ -183,8 +183,21 @@ impl NeoInstance {
         let strict = config.strict;
         let low_latency = config.enable_low_latency;
         let thread_camera = self.clone();
+
+        // Block until the previous stream for this kind has fully stopped (STOP_VIDEO acked).
+        // This prevents a new START_VIDEO from racing with an in-flight STOP_VIDEO, which
+        // causes Reolink cameras to reset all active streams.
+        let stream_permit = self.stream_semaphores[&stream]
+            .clone()
+            .acquire_owned()
+            .await
+            .context("stream semaphore closed")?;
+
         tokio::task::spawn(
             tokio::task::spawn(async move {
+                // Hold the per-stream-kind permit for the entire task lifetime.
+                // Released only after shutdown() completes below.
+                let _stream_permit = stream_permit;
                 thread_camera
                     .run_task(move |cam| {
                         let media_tx = media_tx.clone();
@@ -194,8 +207,14 @@ impl NeoInstance {
                                 cam.start_video(stream, buffer_size, strict).await?;
                             log::trace!("Camera started");
                             while let Ok(media) = media_stream.get_data().await? {
-                                media_tx.send(media).await?;
+                                if media_tx.send(media).await.is_err() {
+                                    break; // receiver dropped — RTSP client disconnected
+                                }
                             }
+                            // Await the STOP_VIDEO handshake before returning.
+                            // This ensures the permit is not released until the camera
+                            // has acknowledged the stream stop.
+                            media_stream.shutdown().await.ok();
                             AnyResult::Ok(())
                         })
                     })
