@@ -86,8 +86,21 @@ impl NeoCamThread {
         log::trace!("  - Connected");
 
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
-        if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
-            log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
+        // Bound the time update. On a freshly rebooted/reconnected camera
+        // `get_time` can hang with no reply; without a cap `run_camera` would
+        // never reach the publish below, so the camera would never be advertised
+        // as live and streams (and the RTSP live-camera gate) would never recover.
+        match timeout(
+            Duration::from_secs(5),
+            update_camera_time(&camera, &name, config.update_time),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!(
+                "{name}: Could not set camera time (perhaps missing on this camera or your login is not an admin): {e:?}"
+            ),
+            Err(_) => log::warn!("{name}: Timed out updating camera time; continuing"),
         }
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
 

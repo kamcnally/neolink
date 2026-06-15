@@ -84,7 +84,21 @@ impl StreamData {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.abort_handle.cancel();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.await?;
+            // The task runs a bounded best-effort STOP_VIDEO handshake after
+            // cancellation (see start_video), so it normally finishes in ~2s.
+            // Cap the wait anyway: this is called while the caller holds the
+            // per-stream-kind semaphore, and a wedged task must never pin that
+            // permit and block the next session for this stream from starting.
+            match tokio::time::timeout(tokio::time::Duration::from_secs(3), handle).await {
+                Ok(join_res) => {
+                    let _ = join_res?;
+                }
+                Err(_) => {
+                    log::warn!(
+                        "StreamData::shutdown: stream task did not stop within 3s; detaching"
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -154,8 +168,6 @@ impl BcCamera {
         let channel_id = self.channel_id;
 
         let handle = task::spawn(async move {
-            let mut sub_video = connection.subscribe(MSG_ID_VIDEO, msg_num).await?;
-
             // On an E1 and swann cameras:
             //  - mainStream always has a value of 0
             //  - subStream always has a value of 1
@@ -212,35 +224,42 @@ impl BcCamera {
                 },
             );
 
-            sub_video.send(start_video).await?;
+            // Guard the ENTIRE setup+stream phase with the cancellation token.
+            // Previously only the media-read loop below was guarded, so an abort
+            // that arrived while the task was still subscribing or waiting for the
+            // START_VIDEO 200 reply was ignored. On a dead/half-dead connection
+            // that reply never arrives (the poller only forwards an error when the
+            // socket actually yields one), so the task hung forever and the
+            // detached task kept the old connection alive. Now cancellation is
+            // honoured at every await point and the task always finishes promptly.
+            let stream_result: Result<()> = tokio::select! {
+                _ = abort_handle_thread.cancelled() => Ok(()),
+                r = async {
+                    let mut sub_video = connection.subscribe(MSG_ID_VIDEO, msg_num).await?;
+                    sub_video.send(start_video).await?;
 
-            let msg = sub_video.recv().await?;
-            if let BcMeta {
-                response_code: 200, ..
-            } = msg.meta
-            {
-            } else {
-                return Err(Error::UnintelligibleReply {
-                    _reply: std::sync::Arc::new(Box::new(msg)),
-                    why: "The camera did not accept the stream start command.",
-                });
-            }
+                    let msg = sub_video.recv().await?;
+                    if let BcMeta {
+                        response_code: 200, ..
+                    } = msg.meta
+                    {
+                    } else {
+                        return Err(Error::UnintelligibleReply {
+                            _reply: std::sync::Arc::new(Box::new(msg)),
+                            why: "The camera did not accept the stream start command.",
+                        });
+                    }
 
-            {
-                let mut media_sub = sub_video.bcmedia_stream(strict);
-
-                tokio::select! {
-                    _ = abort_handle_thread.cancelled() => {},
-                    _ = async {
-                        while let Some(bc_media) = media_sub.next().await {
-                            // We now have a complete interesting packet. Send it to on the callback
-                            if tx.send(bc_media).await.is_err() {
-                                break; // Connection dropped
-                            }
+                    let mut media_sub = sub_video.bcmedia_stream(strict);
+                    while let Some(bc_media) = media_sub.next().await {
+                        // Complete interesting packet — forward it to the receiver
+                        if tx.send(bc_media).await.is_err() {
+                            break; // receiver gone / connection dropped
                         }
-                    } => {}
-                }
-            }
+                    }
+                    Ok(())
+                } => r,
+            };
 
             let stop_video = Bc::new_from_xml(
                 BcMeta {
@@ -261,35 +280,49 @@ impl BcCamera {
                     ..Default::default()
                 },
             );
-            let mut sub_stop = connection.subscribe(MSG_ID_VIDEO_STOP, msg_num).await?;
-            sub_stop.send(stop_video).await?;
 
-            tokio::select! {
-                v = async {
-                    loop {
-                        let msg = sub_stop.recv().await?;
-                        if let BcMeta {
-                            response_code: 200,
-                            msg_id: MSG_ID_VIDEO_STOP,
-                            ..
-                        } = msg.meta {
-                            return Ok(());
-                        }
-                        else if let BcMeta {
-                            msg_id: MSG_ID_VIDEO_STOP,
-                            ..
-                        }   = msg.meta {
-                            return Err(Error::CameraServiceUnavailable{
-                                id: msg.meta.msg_id,
-                                code: msg.meta.response_code,
-                            });
-                        }
+            // Best-effort STOP_VIDEO handshake.
+            //
+            // We only reach here during teardown (the cancellation token fired
+            // or the media stream ended). The connection may already be dead
+            // (camera reboot, network drop, go2rtc forcing a reconnect). On a
+            // dead socket `subscribe`/`send` can block until the OS TCP timeout
+            // (minutes) because the writer task's channel backs up.
+            //
+            // The caller holds the per-stream-kind semaphore until this task
+            // finishes, so a hang here blocks the *next* session for this stream
+            // from ever starting (only some streams recover after a reconnect).
+            // Bound the entire handshake with one timeout so the task always
+            // finishes promptly after cancellation, releasing the semaphore and
+            // not leaving a detached task wedged on a dead connection. Errors are
+            // ignored — we are shutting down regardless.
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+                let mut sub_stop = connection.subscribe(MSG_ID_VIDEO_STOP, msg_num).await?;
+                sub_stop.send(stop_video).await?;
+                loop {
+                    let msg = sub_stop.recv().await?;
+                    if let BcMeta {
+                        response_code: 200,
+                        msg_id: MSG_ID_VIDEO_STOP,
+                        ..
+                    } = msg.meta
+                    {
+                        return Ok::<(), Error>(());
+                    } else if let BcMeta {
+                        msg_id: MSG_ID_VIDEO_STOP,
+                        ..
+                    } = msg.meta
+                    {
+                        return Err(Error::CameraServiceUnavailable {
+                            id: msg.meta.msg_id,
+                            code: msg.meta.response_code,
+                        });
                     }
-                } => v,
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {Ok(())},
-            }?;
+                }
+            })
+            .await;
 
-            Ok(())
+            stream_result
         });
 
         Ok(StreamData {

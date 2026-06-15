@@ -172,6 +172,32 @@ pub(super) async fn make_factory(
                     let camera = camera.clone();
                     let name = name.clone();
                     tokio::task::spawn(async move {
+                        // Don't accept the client until the camera is actually
+                        // connected. If we build a real pipeline now we'd block
+                        // learning the stream type on frames that cannot arrive, and
+                        // go2rtc times out before the camera reconnects. Wait briefly
+                        // for a live camera; if it doesn't come, hand back the
+                        // *unmodified* factory element so the default "Stream not
+                        // Ready" splash pipeline (which already has pay0) is used, and
+                        // the client retries. We must NOT clear_bin it first or there
+                        // is no element to serve and gstreamer fails to create one.
+                        // (When the camera is already live the predicate is already
+                        // true, so this returns immediately.)
+                        let mut cam_watch = camera.camera();
+                        if tokio::time::timeout(
+                            Duration::from_secs(2),
+                            cam_watch.wait_for(|w| w.upgrade().is_some()),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            log::info!(
+                                "{name}::{stream}: camera not yet reconnected; serving 'Stream not Ready' splash (will retry)"
+                            );
+                            let _ = reply.send(element);
+                            return AnyResult::Ok(());
+                        }
+
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
 
@@ -185,24 +211,32 @@ pub(super) async fn make_factory(
                         let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
-                            stream_config.update_from_media(&media);
-                            buffer.push(media);
-                            if stream_config.enable_low_latency {
-                                if frame_count > 5
+                        // Bound the learn phase: if the camera goes live then drops
+                        // again, frames can stall here. On timeout we proceed with
+                        // whatever we have (usually nothing -> the unknown/splash
+                        // pipeline below) so the client gets a valid pipeline back
+                        // instead of hanging.
+                        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                            while let Some(media) = media_rx.recv().await {
+                                stream_config.update_from_media(&media);
+                                buffer.push(media);
+                                if stream_config.enable_low_latency {
+                                    if frame_count > 5
+                                        || (stream_config.vid_type.is_some()
+                                            && stream_config.aud_type.is_some())
+                                    {
+                                        break;
+                                    }
+                                } else if frame_count > 10
                                     || (stream_config.vid_type.is_some()
                                         && stream_config.aud_type.is_some())
                                 {
                                     break;
                                 }
-                            } else if frame_count > 10
-                                || (stream_config.vid_type.is_some()
-                                    && stream_config.aud_type.is_some())
-                            {
-                                break;
+                                frame_count += 1;
                             }
-                            frame_count += 1;
-                        }
+                        })
+                        .await;
 
                         log::trace!("{name}::{stream}: Building the pipeline");
                         // Build the right video pipeline
@@ -279,7 +313,7 @@ pub(super) async fn make_factory(
                             }
 
                             log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
+                            'outer: while let Some(data) = media_rx.blocking_recv() {
                                 let frames = if stream_config.enable_low_latency {
                                     drain_to_latest(data, &mut media_rx)
                                 } else {
@@ -296,8 +330,20 @@ pub(super) async fn make_factory(
                                         &mut aud_ts,
                                         &stream_config,
                                     );
-                                    if let Err(r) = &r {
-                                        log::info!("Failed to send to source: {r:?}");
+                                    if let Err(e) = &r {
+                                        if e.chain().any(|c| c.to_string().contains("App source")) {
+                                            // The appsrc's bus/pad is gone because the
+                                            // RTSP client disconnected. This is the normal
+                                            // end of a viewing session, not a failure.
+                                            log::info!(
+                                                "{name}::{stream}: RTSP viewer disconnected; stopping stream until the next client connects (normal)"
+                                            );
+                                            break 'outer;
+                                        } else {
+                                            log::warn!(
+                                                "{name}::{stream}: Error sending frame to RTSP source: {e:?}"
+                                            );
+                                        }
                                     }
                                     r?;
                                 }
