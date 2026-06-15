@@ -41,6 +41,8 @@ pub struct StreamData {
     handle: Option<JoinHandle<Result<()>>>,
     rx: Receiver<Result<BcMedia>>,
     abort_handle: CancellationToken,
+    /// Human-readable label for logging (e.g. "mainStream", "replay").
+    label: String,
 }
 
 impl StreamData {
@@ -49,11 +51,13 @@ impl StreamData {
         handle: JoinHandle<Result<()>>,
         rx: Receiver<Result<BcMedia>>,
         abort_handle: CancellationToken,
+        label: impl Into<String>,
     ) -> Self {
         Self {
             handle: Some(handle),
             rx,
             abort_handle,
+            label: label.into(),
         }
     }
 
@@ -94,9 +98,7 @@ impl StreamData {
                     let _ = join_res?;
                 }
                 Err(_) => {
-                    log::warn!(
-                        "StreamData::shutdown: stream task did not stop within 3s; detaching"
-                    );
+                    log::warn!("{}: stream task did not stop within 3s; detaching", self.label);
                 }
             }
         }
@@ -106,24 +108,29 @@ impl StreamData {
 
 impl Drop for StreamData {
     fn drop(&mut self) {
-        log::info!("StreamData::drop: starting");
         self.abort_handle.cancel();
-        log::info!("StreamData::drop: abort_handle cancelled");
-        if let Some(handle) = self.handle.as_ref() {
-            if handle.is_finished() {
-                log::info!("StreamData::drop: handle is finished, dropping");
-            } else {
-                log::warn!("StreamData::drop: handle is NOT finished, detaching (task may continue)");
+        match self.handle.as_ref() {
+            Some(handle) if handle.is_finished() => {
+                log::trace!("{}: stream task finished before drop", self.label);
             }
-        } else {
-            log::info!("StreamData::drop: no handle to drop");
+            Some(_) => {
+                // Expected on abrupt teardown: the task is still running but has
+                // been cancelled and runs a bounded (~2s) best-effort STOP, so it
+                // self-terminates shortly. Detaching here is safe.
+                log::trace!(
+                    "{}: stream task still running after cancel; will self-terminate within ~2s",
+                    self.label
+                );
+            }
+            None => {
+                // shutdown() already took and awaited the handle.
+                log::trace!("{}: stream already shut down", self.label);
+            }
         }
-        // Just drop the handle. If it's finished, dropping is fine.
-        // If it's not finished, dropping detaches it (task continues but we don't wait).
-        // We've already cancelled via abort_handle, so the task should finish soon.
+        // Drop (detach) the handle. We've already cancelled via abort_handle and
+        // the task's STOP handshake is bounded, so it finishes soon on its own.
         // This avoids spawning a task that keeps the runtime alive.
         self.handle.take();
-        log::info!("StreamData::drop: complete");
     }
 }
 
@@ -322,6 +329,7 @@ impl BcCamera {
             })
             .await;
 
+            log::trace!("{stream}: stream task exited ({stream_result:?})");
             stream_result
         });
 
@@ -329,6 +337,7 @@ impl BcCamera {
             handle: Some(handle),
             rx,
             abort_handle,
+            label: stream.to_string(),
         })
     }
 

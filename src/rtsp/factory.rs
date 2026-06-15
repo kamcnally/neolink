@@ -168,7 +168,7 @@ pub(super) async fn make_factory(
         while let Some(msg) = client_rx.recv().await {
             match msg {
                 ClientMsg::NewClient { element, reply } => {
-                    log::debug!("New client for {name}::{stream}");
+                    log::info!("{name}::{stream}: RTSP viewer connected; starting stream");
                     let camera = camera.clone();
                     let name = name.clone();
                     tokio::task::spawn(async move {
@@ -392,9 +392,8 @@ fn drain_to_latest(
     match last_iframe_idx {
         Some(idx) => {
             if idx > 0 {
-                log::info!(
-                    "Low-latency: dropping {} stale frames, skipping to latest I-frame",
-                    idx
+                log::debug!(
+                    "Low-latency: skipped {idx} stale frame(s) to catch up to the latest I-frame (normal)"
                 );
             }
             frames.split_off(idx)
@@ -507,7 +506,7 @@ fn acquire_pooled_buffer(
             cfg.set_params(None, bucket as u32, 8, 64);
             pool.set_config(cfg).expect("pool config failed");
             pool.set_active(true).expect("activate pool");
-            log::info!("New BufferPool (Bucket) allocated: size={bucket}");
+            log::debug!("RTSP: allocated new buffer pool bucket (size={bucket} bytes)");
             pool
         });
 

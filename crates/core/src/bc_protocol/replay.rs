@@ -1226,7 +1226,7 @@ impl BcCamera {
             Ok(())
         });
 
-        Ok(StreamData::from_parts(handle, rx, abort_handle))
+        Ok(StreamData::from_parts(handle, rx, abort_handle, "replay"))
     }
 
     /// Start download by time range (MSG 143). Returns a stream of BCMedia; when dropped, sends stop (MSG 144).
@@ -1446,7 +1446,7 @@ impl BcCamera {
             Ok(())
         });
 
-        Ok(StreamData::from_parts(handle, rx, abort_handle))
+        Ok(StreamData::from_parts(handle, rx, abort_handle, "download"))
     }
 
     /// Stop replay (MSG 7). Pass channel and file name from the playing file.

@@ -110,6 +110,7 @@ impl NeoCamThread {
             d.connected_since = Some(Instant::now());
             d.last_error = None;
         });
+        log::info!("{name}: camera now live");
 
         let cancel_check = self.cancel.clone();
         // Now we wait for a disconnect
@@ -130,6 +131,14 @@ impl NeoCamThread {
                     match timeout(Duration::from_secs(5), camera.get_linktype()).await {
                         Ok(Ok(_)) => {
                             log::trace!("Ping reply");
+                            if missed_pings > 0 {
+                                // We had been missing pings but the camera is
+                                // responding again — recovered without a reconnect.
+                                log::info!(
+                                    "{name}: Camera ping recovered after {missed_pings} missed (~{}s blip); connection healthy",
+                                    missed_pings * 5
+                                );
+                            }
                             missed_pings = 0;
                             continue
                         },
@@ -148,9 +157,15 @@ impl NeoCamThread {
                             // blip doesn't trigger an unnecessary reconnect.
                             if missed_pings < 10 {
                                 missed_pings += 1;
+                                log::warn!(
+                                    "{name}: Camera ping timed out ({missed_pings}/10); tolerating possible network blip"
+                                );
                                 continue;
                             } else {
-                                log::error!("Timed out waiting for camera ping reply");
+                                log::error!(
+                                    "{name}: Camera ping timed out after {missed_pings} tolerated misses (~{}s); tearing down connection to reconnect",
+                                    missed_pings * 5
+                                );
                                 break Err(anyhow::anyhow!("Timed out waiting for camera ping reply"));
                             }
                         }
@@ -228,6 +243,11 @@ impl NeoCamThread {
 
             if now.elapsed() > Duration::from_secs(60) {
                 // Command ran long enough to be considered a success
+                if backoff > MIN_BACKOFF {
+                    log::debug!(
+                        "{name}: connection stable >60s; reconnect backoff reset to {MIN_BACKOFF:?}"
+                    );
+                }
                 backoff = MIN_BACKOFF;
                 self.diag.send_modify(|d| d.reconnect_attempts = 0);
             }
