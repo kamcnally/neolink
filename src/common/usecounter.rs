@@ -63,6 +63,14 @@ impl UseCounter {
         Ok(res)
     }
 
+    /// Read the current number of active users without taking a permit.
+    ///
+    /// This is side-effect free (it does not create or activate a permit) so it
+    /// is safe to call from the healthcheck without waking an idle camera.
+    pub(crate) fn count(&self) -> u32 {
+        *self.value.borrow()
+    }
+
     #[cfg(feature = "gstreamer")]
     #[allow(dead_code)]
     pub(crate) async fn create_deactivated(&self) -> Result<Permit> {

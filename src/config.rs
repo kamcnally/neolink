@@ -49,6 +49,42 @@ pub(crate) struct Config {
     #[validate(nested)]
     #[serde(default)]
     pub(crate) users: Vec<UserConfig>,
+
+    #[validate(nested)]
+    #[serde(default)]
+    pub(crate) healthcheck: HealthcheckConfig,
+}
+
+/// Configuration for the HTTP healthcheck/diagnostics endpoint.
+///
+/// This server is **enabled by default** (port 8555). It exposes a single
+/// `GET /health` endpoint whose status code is the verdict (200 healthy / 503
+/// unhealthy) and whose JSON body carries per-camera detail, so container
+/// orchestrators (Docker Compose, Kubernetes, ...) can probe whether the
+/// cameras are healthy. Set `enabled = false` to turn it off.
+#[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
+pub(crate) struct HealthcheckConfig {
+    #[serde(default = "default_healthcheck_enabled")]
+    pub(crate) enabled: bool,
+
+    #[serde(rename = "bind", default = "default_bind_addr")]
+    pub(crate) bind_addr: String,
+
+    // min = 1: port 0 would make the listener pick a random ephemeral port at
+    // runtime, breaking probes that expect a stable endpoint.
+    #[validate(range(min = 1, max = 65535, message = "Invalid port", code = "port"))]
+    #[serde(default = "default_healthcheck_port")]
+    pub(crate) port: u16,
+}
+
+impl Default for HealthcheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_healthcheck_enabled(),
+            bind_addr: default_bind_addr(),
+            port: default_healthcheck_port(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, PartialEq, Eq)]
@@ -449,6 +485,14 @@ fn default_bind_addr() -> String {
 
 fn default_bind_port() -> u16 {
     8554
+}
+
+fn default_healthcheck_port() -> u16 {
+    8555
+}
+
+fn default_healthcheck_enabled() -> bool {
+    true
 }
 
 fn default_stream() -> StreamConfig {

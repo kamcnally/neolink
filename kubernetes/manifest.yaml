@@ -26,8 +26,18 @@ spec:
         image: quantumentangledandy/neolink
         ports:
           - containerPort: 8554
+          - containerPort: 8555
         command: ["/bin/sh", "-c"]
         args: ["cp /config/neolink.toml /etc/neolink.toml && /usr/local/bin/neolink rtsp --config /etc/neolink.toml"]
+        # Requires a [healthcheck] section in the config below.
+        # Readiness only: /health returns 503 when a camera is down, which
+        # removes the pod from the Service endpoints without restarting it.
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8555
+          initialDelaySeconds: 20
+          periodSeconds: 30
         volumeMounts:
           - name: config-volume
             mountPath: /config
@@ -56,6 +66,9 @@ spec:
     port: 8554
     protocol: TCP
     targetPort: 8554
+  # Port 8555 (healthcheck) is intentionally NOT published here. The endpoint is
+  # unauthenticated and returns per-camera diagnostics, so it stays internal to
+  # the pod for the readiness probe only.
   selector:
     app: neolink
   type: LoadBalancer
@@ -103,6 +116,11 @@ data:
     # mqtt.broker_addr = "192.168.1.122"
     # mqtt.port = 1883
     # mqtt.credentials = ["mqtt_user", "mqtt_password"]
+
+    # Required by the liveness/readiness probes defined on the Deployment above.
+    [healthcheck]
+    bind = "0.0.0.0"
+    port = 8555
 
 
     [[cameras]]

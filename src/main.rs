@@ -42,6 +42,7 @@ mod common;
 mod config;
 mod disk;
 mod encoding;
+mod healthcheck;
 mod replay;
 #[cfg(feature = "gstreamer")]
 mod image;
@@ -88,6 +89,27 @@ async fn main() -> Result<()> {
         .with_context(|| format!("Failed to validate the {:?} config file", conf_path))?;
 
     let neo_reactor = NeoReactor::new(config.clone()).await;
+
+    // Healthcheck/diagnostics HTTP server. Enabled by default; runs for the life
+    // of the process alongside whichever command is selected. Only meaningful for
+    // the long-running serving modes (rtsp/mqtt) but harmless otherwise. Disable
+    // with `[healthcheck] enabled = false` in the config.
+    if config.healthcheck.enabled {
+        let healthcheck_config = config.healthcheck.clone();
+        let healthcheck_reactor = neo_reactor.clone();
+        let healthcheck_cancel = tokio_util::sync::CancellationToken::new();
+        tokio::spawn(async move {
+            if let Err(e) =
+                healthcheck::run(healthcheck_config, healthcheck_reactor, healthcheck_cancel).await
+            {
+                // The healthcheck is a critical service when enabled (e.g. the
+                // container HEALTHCHECK depends on it). If it cannot run, fail
+                // the whole process rather than silently lose the endpoint.
+                error!("Healthcheck server failed: {e:?}");
+                std::process::exit(1);
+            }
+        });
+    }
 
     match opt.cmd {
         #[cfg(feature = "gstreamer")]

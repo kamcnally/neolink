@@ -14,11 +14,53 @@ pub(crate) enum NeoCamThreadState {
     Disconnected,
 }
 
+/// Coarse connection phase published for diagnostics/healthcheck.
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+pub(crate) enum DiagPhase {
+    /// Currently attempting to (re)connect and log in.
+    Connecting,
+    /// Connected and advertised as live.
+    Connected,
+    /// Lost the connection after an error and waiting to retry.
+    Reconnecting,
+    /// Intentionally disconnected (manual disconnect or idle/battery saving).
+    Idle,
+    /// Login credentials were rejected; this is fatal and will not retry.
+    LoginFailed,
+    /// The camera thread shut down normally.
+    Stopped,
+}
+
+/// A snapshot of a camera connection's health, published over a watch channel
+/// by [`NeoCamThread`] and surfaced by the healthcheck endpoint.
+#[derive(Debug, Clone)]
+pub(crate) struct CameraDiagnostics {
+    pub(crate) phase: DiagPhase,
+    /// When the current connection was established (for uptime).
+    pub(crate) connected_since: Option<Instant>,
+    /// Number of failed connection attempts since the last stable connection.
+    pub(crate) reconnect_attempts: u32,
+    /// The most recent connection error, if any.
+    pub(crate) last_error: Option<String>,
+}
+
+impl Default for CameraDiagnostics {
+    fn default() -> Self {
+        Self {
+            phase: DiagPhase::Connecting,
+            connected_since: None,
+            reconnect_attempts: 0,
+            last_error: None,
+        }
+    }
+}
+
 pub(crate) struct NeoCamThread {
     state: WatchReceiver<NeoCamThreadState>,
     config: WatchReceiver<CameraConfig>,
     cancel: CancellationToken,
     camera_watch: WatchSender<Weak<BcCamera>>,
+    diag: WatchSender<CameraDiagnostics>,
 }
 
 impl NeoCamThread {
@@ -26,6 +68,7 @@ impl NeoCamThread {
         watch_state_rx: WatchReceiver<NeoCamThreadState>,
         watch_config_rx: WatchReceiver<CameraConfig>,
         camera_watch_tx: WatchSender<Weak<BcCamera>>,
+        diag_tx: WatchSender<CameraDiagnostics>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -33,6 +76,7 @@ impl NeoCamThread {
             config: watch_config_rx,
             cancel,
             camera_watch: camera_watch_tx,
+            diag: diag_tx,
         }
     }
     async fn run_camera(&mut self, config: &CameraConfig) -> AnyResult<()> {
@@ -48,6 +92,11 @@ impl NeoCamThread {
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
 
         self.camera_watch.send_replace(Arc::downgrade(&camera));
+        self.diag.send_modify(|d| {
+            d.phase = DiagPhase::Connected;
+            d.connected_since = Some(Instant::now());
+            d.last_error = None;
+        });
 
         let cancel_check = self.cancel.clone();
         // Now we wait for a disconnect
@@ -111,10 +160,23 @@ impl NeoCamThread {
         let mut backoff = MIN_BACKOFF;
 
         loop {
+            // While the desired state is Disconnected we are intentionally idle
+            // (manual disconnect or idle/battery saving), not in an error state.
+            if !matches!(*self.state.borrow(), NeoCamThreadState::Connected) {
+                self.diag.send_modify(|d| {
+                    d.phase = DiagPhase::Idle;
+                    d.connected_since = None;
+                });
+            }
             self.state
                 .clone()
                 .wait_for(|state| matches!(state, NeoCamThreadState::Connected))
                 .await?;
+            self.diag.send_modify(|d| {
+                if !matches!(d.phase, DiagPhase::Connected) {
+                    d.phase = DiagPhase::Connecting;
+                }
+            });
             let mut config_rec = self.config.clone();
 
             let config = config_rec.borrow_and_update().clone();
@@ -151,6 +213,7 @@ impl NeoCamThread {
             if now.elapsed() > Duration::from_secs(60) {
                 // Command ran long enough to be considered a success
                 backoff = MIN_BACKOFF;
+                self.diag.send_modify(|d| d.reconnect_attempts = 0);
             }
             if backoff > MAX_BACKOFF {
                 backoff = MAX_BACKOFF;
@@ -160,6 +223,10 @@ impl NeoCamThread {
                 Ok(()) => {
                     // Normal shutdown
                     log::trace!("Normal camera shutdown");
+                    self.diag.send_modify(|d| {
+                        d.phase = DiagPhase::Stopped;
+                        d.connected_since = None;
+                    });
                     self.cancel.cancel();
                     return Ok(());
                 }
@@ -171,6 +238,11 @@ impl NeoCamThread {
                         Some(neolink_core::Error::CameraLoginFail) => {
                             // Fatal
                             log::error!("{name}: Login credentials were not accepted");
+                            self.diag.send_modify(|d| {
+                                d.phase = DiagPhase::LoginFailed;
+                                d.connected_since = None;
+                                d.last_error = Some(format!("{e:?}"));
+                            });
                             self.cancel.cancel();
                             return Err(e);
                         }
@@ -178,6 +250,12 @@ impl NeoCamThread {
                             // Non fatal
                             log::warn!("{name}: Connection Lost: {:?}", e);
                             log::info!("{name}: Attempt reconnect in {:?}", backoff);
+                            self.diag.send_modify(|d| {
+                                d.phase = DiagPhase::Reconnecting;
+                                d.connected_since = None;
+                                d.reconnect_attempts = d.reconnect_attempts.saturating_add(1);
+                                d.last_error = Some(format!("{e:?}"));
+                            });
                             sleep(backoff).await;
                             backoff *= 2;
                         }

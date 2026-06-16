@@ -1,0 +1,34 @@
+# Example docker-compose for neolink.
+#
+# 1. Put your neolink.toml next to this file (see sample_config.toml / README).
+# 2. `docker compose up -d`
+#
+# The healthcheck endpoint is enabled by default (no config needed); the
+# healthcheck below probes it over localhost inside the container.
+#
+# Check container health with:
+#      docker inspect --format '{{.State.Health.Status}}' neolink
+services:
+  neolink:
+    image: ghcr.io/mutuallyassureddeployment/neolink:latest
+    container_name: neolink
+    restart: unless-stopped
+    # `--network host` (network_mode: host) is only needed for local broadcast
+    # discovery. If you connect to cameras by IP, the published ports below are
+    # enough. Note: host mode ignores the `ports:` mapping.
+    # network_mode: host
+    ports:
+      - "8554:8554"   # RTSP
+      # The healthcheck works without publishing 8555 (the container probes
+      # itself over localhost). Uncomment only if you want to reach /health
+      # from outside the container.
+      # - "8555:8555"   # healthcheck / diagnostics
+    volumes:
+      - ./neolink.toml:/etc/neolink.toml:ro
+    healthcheck:
+      # Returns 503 (=> unhealthy) when any enabled camera is not connected.
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8555/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

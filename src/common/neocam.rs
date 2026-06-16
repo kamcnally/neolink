@@ -20,8 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState, NeoInstance, Permit,
-    UseCounter,
+    CameraDiagnostics, MdRequest, MdState, NeoCamMdThread, NeoCamThread, NeoCamThreadState,
+    NeoInstance, Permit, UseCounter,
 };
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
@@ -34,6 +34,8 @@ pub(crate) enum NeoCamCommand {
     Instance(OneshotSender<Result<NeoInstance>>),
     Motion(OneshotSender<WatchReceiver<MdState>>),
     Config(OneshotSender<WatchReceiver<CameraConfig>>),
+    Diagnostics(OneshotSender<WatchReceiver<CameraDiagnostics>>),
+    GetUseCount(OneshotSender<u32>),
     Disconnect(OneshotSender<()>),
     Connect(OneshotSender<()>),
     State(OneshotSender<NeoCamThreadState>),
@@ -61,6 +63,7 @@ impl NeoCam {
         let (camera_watch_tx, camera_watch_rx) = watch(Weak::new());
         let (md_request_tx, md_request_rx) = mpsc(100);
         let (state_tx, state_rx) = watch(NeoCamThreadState::Connected);
+        let (diag_tx, diag_rx) = watch(CameraDiagnostics::default());
         let (uid_tx, uid_rx) = watch(config.camera_uid.clone());
 
         let set = JoinSet::new();
@@ -83,6 +86,7 @@ impl NeoCam {
         let mut commander_rx = ReceiverStream::new(commander_rx);
         let thread_commander_tx = commander_tx.clone();
         let thread_watch_config_rx = watch_config_rx.clone();
+        let thread_diag_rx = diag_rx.clone();
         #[cfg(feature = "pushnoti")]
         let thread_pn_request_tx = pn_request_tx.clone();
 
@@ -116,6 +120,12 @@ impl NeoCam {
                             },
                             NeoCamCommand::Config(sender) => {
                                 let _ = sender.send(thread_watch_config_rx.clone());
+                            },
+                            NeoCamCommand::Diagnostics(sender) => {
+                                let _ = sender.send(thread_diag_rx.clone());
+                            },
+                            NeoCamCommand::GetUseCount(sender) => {
+                                let _ = sender.send(users.count());
                             },
                             NeoCamCommand::Connect(sender) => {
                                 if !matches!(*state_tx.borrow(), NeoCamThreadState::Connected) {
@@ -176,6 +186,7 @@ impl NeoCam {
             state_rx,
             thread_watch_config_rx,
             camera_watch_tx,
+            diag_tx,
             me.cancel.clone(),
         )
         .await;
