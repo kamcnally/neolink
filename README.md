@@ -89,6 +89,75 @@ docker run \
 |---|---|---|
 | `NEO_LINK_MODE` | `rtsp` | Mode: `rtsp`, `mqtt`, or `mqtt-rtsp` |
 | `NEO_LINK_PORT` | `8554` | RTSP listen port |
+| `NEO_HEALTH_PORT` | `8555` | Port used by the image `HEALTHCHECK` (must match the `[healthcheck]` port in your config) |
+
+### Healthcheck endpoint
+
+Neolink runs a small HTTP healthcheck/diagnostics server so an orchestrator
+(Docker Compose, Kubernetes, ...) can tell whether the container is actually
+serving healthy cameras — not just that the process is alive.
+
+It is **enabled by default on port 8555** — no config required. The published
+image's `HEALTHCHECK` probes it over localhost inside the container, so you do
+**not** need to publish port 8555 unless you also want to reach `/health` from
+outside.
+
+There is a single endpoint, `GET /health`, where the **status code is the
+verdict and the JSON body is the detail**:
+
+- `200` — healthy
+- `503` — unhealthy
+
+**Strict readiness:** `/health` returns `503` whenever any *enabled* camera that
+should be connected is not (e.g. unreachable or stuck reconnecting). Cameras that
+are intentionally disconnected (manual disconnect, or `idle`/battery saving)
+report as `idle` and stay healthy. Disabled cameras are reported but never affect
+overall health.
+
+The JSON body reports, per camera: `state`, `live`, configured `streams`,
+`active_uses`, `uptime_secs`, `reconnect_attempts`, and `last_error`, plus the
+neolink `version`/`profile`. Example:
+
+```bash
+curl -s localhost:8555/health | jq    # body for humans; exit code for probes (curl -f)
+```
+
+To change the port or turn it off, add a `[healthcheck]` section to
+`neolink.toml`:
+
+```toml
+[healthcheck]
+enabled = true     # optional, default true — set false to disable
+bind = "0.0.0.0"   # optional, default 0.0.0.0
+port = 8555        # optional, default 8555
+```
+
+> If you disable the endpoint, also override/disable the image's `HEALTHCHECK`
+> (e.g. in your `docker run`/compose config), or the container will report
+> unhealthy because the probe has nothing to talk to.
+
+### Docker Compose
+
+A ready-to-edit [`docker-compose.yml`](docker-compose.yml) is included:
+
+```yaml
+services:
+  neolink:
+    image: ghcr.io/mutuallyassureddeployment/neolink:latest
+    restart: unless-stopped
+    # --network host is only needed for local broadcast discovery.
+    ports:
+      - "8554:8554"   # RTSP
+      # - "8555:8555" # healthcheck — only needed to reach /health from outside
+    volumes:
+      - ./neolink.toml:/etc/neolink.toml:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://localhost:8555/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+```
 
 ### Building from source
 

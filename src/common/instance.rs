@@ -15,7 +15,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{MdState, NeoCamCommand, NeoCamThreadState, Permit};
+use super::{CameraDiagnostics, MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
 use neolink_core::bc_protocol::BcCamera;
 
@@ -242,6 +242,26 @@ impl NeoInstance {
         let (instance_tx, instance_rx) = oneshot();
         self.camera_control
             .send(NeoCamCommand::Config(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
+    /// Subscribe to the camera's connection diagnostics (phase, uptime,
+    /// reconnect attempts, last error). Used by the healthcheck endpoint.
+    pub(crate) async fn diagnostics(&self) -> Result<WatchReceiver<CameraDiagnostics>> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::Diagnostics(instance_tx))
+            .await?;
+        Ok(instance_rx.await?)
+    }
+
+    /// The current number of active uses of this camera (streams, motion,
+    /// push notifications, ...). Read-only and side-effect free.
+    pub(crate) async fn use_count(&self) -> Result<u32> {
+        let (instance_tx, instance_rx) = oneshot();
+        self.camera_control
+            .send(NeoCamCommand::GetUseCount(instance_tx))
             .await?;
         Ok(instance_rx.await?)
     }

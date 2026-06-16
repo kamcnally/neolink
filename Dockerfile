@@ -71,6 +71,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         openssl \
+        curl \
         dnsutils \
         iputils-ping \
         ca-certificates \
@@ -95,11 +96,17 @@ RUN groupadd -r -g 10001 neolink && useradd -r -u 10001 -g neolink -d /home/neol
 
 USER neolink
 
-ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
+ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554 NEO_HEALTH_PORT=8555
 
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/usr/local/bin/neolink", "rtsp", "--config", "/etc/neolink.toml"]
-EXPOSE 8554
+EXPOSE 8554 8555
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD /usr/local/bin/neolink --version || exit 1
+# Probe the HTTP healthcheck endpoint. The endpoint is enabled by default (no
+# config needed) and reports the container unhealthy (HTTP 503) when any enabled
+# camera is not connected. The probe uses localhost inside the container, so you
+# do NOT need to publish port 8555 unless you also want to reach /health from
+# outside. If you disable the endpoint (`[healthcheck] enabled = false`), also
+# override/disable this HEALTHCHECK (e.g. in docker-compose) or it will fail.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+  CMD curl -fsS -o /dev/null "http://localhost:${NEO_HEALTH_PORT:-8555}/health" || exit 1

@@ -35,6 +35,15 @@ bind = "0.0.0.0"
 # mqtt.port = 1883
 # mqtt.credentials = ["mqtt_user", "mqtt_password"]
 
+# The HTTP healthcheck/diagnostics endpoint is ENABLED BY DEFAULT on port 8555.
+# It exposes GET /health (200 healthy / 503 unhealthy, with a JSON body of
+# per-camera detail). Useful for Docker/Kubernetes healthchecks.
+# Uncomment to change the port or disable it:
+# [healthcheck]
+# enabled = true   # set false to disable
+# bind = "0.0.0.0" # optional, default 0.0.0.0
+# port = 8555      # optional, default 8555
+
 
 [[cameras]]
 name = "koty"
