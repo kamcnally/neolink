@@ -155,8 +155,8 @@ impl NeoCamThread {
                             // Tolerate ~50s of missed pings (10 x 5s) before tearing
                             // down an otherwise healthy connection, so a brief network
                             // blip doesn't trigger an unnecessary reconnect.
+                            missed_pings += 1;
                             if missed_pings < 10 {
-                                missed_pings += 1;
                                 log::warn!(
                                     "{name}: Camera ping timed out ({missed_pings}/10); tolerating possible network blip"
                                 );
