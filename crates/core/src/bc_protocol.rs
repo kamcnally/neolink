@@ -161,14 +161,26 @@ impl BcCamera {
                 }
             }
             if !sockets.is_empty() {
+                // Retry the direct TCP path a few times before falling back to UDP /
+                // cloud discovery. A camera that just dropped often hasn't freed its
+                // previous TCP session yet, so the first attempt can fail transiently
+                // while the camera is still perfectly reachable on the LAN. Retrying
+                // here lets the fast local path recover in a few seconds instead of
+                // stalling for minutes in the cloud-registration loop below.
+                const TCP_DISCOVERY_ATTEMPTS: usize = 3;
+                const TCP_DISCOVERY_RETRY_DELAY: tokio::time::Duration =
+                    tokio::time::Duration::from_secs(2);
                 info!("{}: Trying TCP discovery", options.name);
-                for socket in sockets.drain(..) {
-                    let channel_id: u8 = options.channel_id;
-                    if let Ok(addr) = discovery.check_tcp(socket, channel_id).await.map(|_| {
-                        info!("{}: TCP Discovery success at {:?}", options.name, &socket);
-                        socket
-                    }) {
-                        return Ok(CameraLocation::Tcp(addr));
+                for attempt in 0..TCP_DISCOVERY_ATTEMPTS {
+                    for socket in sockets.iter() {
+                        let channel_id: u8 = options.channel_id;
+                        if discovery.check_tcp(*socket, channel_id).await.is_ok() {
+                            info!("{}: TCP Discovery success at {:?}", options.name, socket);
+                            return Ok(CameraLocation::Tcp(*socket));
+                        }
+                    }
+                    if attempt + 1 < TCP_DISCOVERY_ATTEMPTS {
+                        tokio::time::sleep(TCP_DISCOVERY_RETRY_DELAY).await;
                     }
                 }
             }

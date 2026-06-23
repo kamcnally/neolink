@@ -26,7 +26,9 @@ use super::{
 #[cfg(feature = "pushnoti")]
 use super::{PnRequest, PushNoti};
 use crate::{config::CameraConfig, AnyResult, Result};
-use neolink_core::bc_protocol::BcCamera;
+use neolink_core::bc_protocol::{BcCamera, StreamKind};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::Semaphore;
 
 #[allow(dead_code)]
 pub(crate) enum NeoCamCommand {
@@ -51,6 +53,7 @@ pub(crate) struct NeoCam {
     commander: MpscSender<NeoCamCommand>,
     camera_watch: WatchReceiver<Weak<BcCamera>>,
     set: JoinSet<AnyResult<()>>,
+    stream_semaphores: Arc<HashMap<StreamKind, Arc<Semaphore>>>,
 }
 
 impl NeoCam {
@@ -69,12 +72,22 @@ impl NeoCam {
         let set = JoinSet::new();
         let users = UseCounter::new().await;
 
+        let stream_semaphores: Arc<HashMap<StreamKind, Arc<Semaphore>>> = Arc::new({
+            let mut m = HashMap::new();
+            m.insert(StreamKind::Main, Arc::new(Semaphore::new(1)));
+            m.insert(StreamKind::Sub, Arc::new(Semaphore::new(1)));
+            m.insert(StreamKind::Extern, Arc::new(Semaphore::new(1)));
+            m
+        });
+        let thread_stream_semaphores = stream_semaphores.clone();
+
         let mut me = Self {
             cancel: CancellationToken::new(),
             config_watch: watch_config_tx,
             commander: commander_tx.clone(),
             camera_watch: camera_watch_rx.clone(),
             set,
+            stream_semaphores: stream_semaphores.clone(),
         };
 
         // This thread recieves messages from the instances
@@ -108,6 +121,7 @@ impl NeoCam {
                                     camera_watch_rx.clone(),
                                     thread_commander_tx.clone(),
                                     thread_cancel.clone(),
+                                    thread_stream_semaphores.clone(),
                                 );
                                 let _ = result.send(instance);
                             }
@@ -401,6 +415,7 @@ impl NeoCam {
             self.camera_watch.clone(),
             self.commander.clone(),
             self.cancel.clone(),
+            self.stream_semaphores.clone(),
         )
     }
 

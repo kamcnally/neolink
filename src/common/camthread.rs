@@ -86,8 +86,21 @@ impl NeoCamThread {
         log::trace!("  - Connected");
 
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
-        if let Err(e) = update_camera_time(&camera, &name, config.update_time).await {
-            log::warn!("Could not set camera time, (perhaps missing on this camera of your login in not an admin): {e:?}");
+        // Bound the time update. On a freshly rebooted/reconnected camera
+        // `get_time` can hang with no reply; without a cap `run_camera` would
+        // never reach the publish below, so the camera would never be advertised
+        // as live and streams (and the RTSP live-camera gate) would never recover.
+        match timeout(
+            Duration::from_secs(5),
+            update_camera_time(&camera, &name, config.update_time),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!(
+                "{name}: Could not set camera time (perhaps missing on this camera or your login is not an admin): {e:?}"
+            ),
+            Err(_) => log::warn!("{name}: Timed out updating camera time; continuing"),
         }
         sleep(Duration::from_secs(2)).await; // Delay a little since some calls will error if camera is waking up
 
@@ -97,6 +110,7 @@ impl NeoCamThread {
             d.connected_since = Some(Instant::now());
             d.last_error = None;
         });
+        log::info!("{name}: camera now live");
 
         let cancel_check = self.cancel.clone();
         // Now we wait for a disconnect
@@ -117,6 +131,14 @@ impl NeoCamThread {
                     match timeout(Duration::from_secs(5), camera.get_linktype()).await {
                         Ok(Ok(_)) => {
                             log::trace!("Ping reply");
+                            if missed_pings > 0 {
+                                // We had been missing pings but the camera is
+                                // responding again — recovered without a reconnect.
+                                log::info!(
+                                    "{name}: Camera ping recovered after {missed_pings} missed (~{}s blip); connection healthy",
+                                    missed_pings * 5
+                                );
+                            }
                             missed_pings = 0;
                             continue
                         },
@@ -130,11 +152,20 @@ impl NeoCamThread {
                         },
                         Err(_) => {
                             // Timeout
-                            if missed_pings < 5 {
-                                missed_pings += 1;
+                            // Tolerate ~50s of missed pings (10 x 5s) before tearing
+                            // down an otherwise healthy connection, so a brief network
+                            // blip doesn't trigger an unnecessary reconnect.
+                            missed_pings += 1;
+                            if missed_pings < 10 {
+                                log::warn!(
+                                    "{name}: Camera ping timed out ({missed_pings}/10); tolerating possible network blip"
+                                );
                                 continue;
                             } else {
-                                log::error!("Timed out waiting for camera ping reply");
+                                log::error!(
+                                    "{name}: Camera ping timed out after {missed_pings} tolerated misses (~{}s); tearing down connection to reconnect",
+                                    missed_pings * 5
+                                );
                                 break Err(anyhow::anyhow!("Timed out waiting for camera ping reply"));
                             }
                         }
@@ -212,6 +243,11 @@ impl NeoCamThread {
 
             if now.elapsed() > Duration::from_secs(60) {
                 // Command ran long enough to be considered a success
+                if backoff > MIN_BACKOFF {
+                    log::debug!(
+                        "{name}: connection stable >60s; reconnect backoff reset to {MIN_BACKOFF:?}"
+                    );
+                }
                 backoff = MIN_BACKOFF;
                 self.diag.send_modify(|d| d.reconnect_attempts = 0);
             }

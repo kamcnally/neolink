@@ -6,10 +6,14 @@
 //! whenever the camera is lost/updated
 use anyhow::{anyhow, Context};
 use futures::TryFutureExt;
-use std::sync::{Arc, Weak};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Weak},
+};
 use tokio::{
     sync::{
         mpsc::Sender as MpscSender, oneshot::channel as oneshot, watch::Receiver as WatchReceiver,
+        Semaphore,
     },
     time::{sleep, Duration},
 };
@@ -17,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{CameraDiagnostics, MdState, NeoCamCommand, NeoCamThreadState, Permit};
 use crate::{config::CameraConfig, AnyResult, Result};
-use neolink_core::bc_protocol::BcCamera;
+use neolink_core::bc_protocol::{BcCamera, StreamKind};
 
 #[cfg(feature = "gstreamer")]
 mod gst;
@@ -33,6 +37,7 @@ pub(crate) struct NeoInstance {
     camera_watch: WatchReceiver<Weak<BcCamera>>,
     camera_control: MpscSender<NeoCamCommand>,
     cancel: CancellationToken,
+    pub(crate) stream_semaphores: Arc<HashMap<StreamKind, Arc<Semaphore>>>,
 }
 
 impl NeoInstance {
@@ -40,11 +45,13 @@ impl NeoInstance {
         camera_watch: WatchReceiver<Weak<BcCamera>>,
         camera_control: MpscSender<NeoCamCommand>,
         cancel: CancellationToken,
+        stream_semaphores: Arc<HashMap<StreamKind, Arc<Semaphore>>>,
     ) -> Result<Self> {
         Ok(Self {
             camera_watch,
             camera_control,
             cancel,
+            stream_semaphores,
         })
     }
 
